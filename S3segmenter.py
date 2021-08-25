@@ -29,6 +29,9 @@ import copy
 import datetime
 from joblib import Parallel, delayed
 from rowit import WindowView, crop_with_padding_mask
+from save_tifffile_pyramid import save_pyramid
+import subprocess
+import ome_types
 
 
 def imshowpair(A,B):
@@ -101,7 +104,7 @@ def contour_pm_watershed(
         padded[padded == 1] = maxima.flatten()
         return padded.astype(np.bool)
 
-def S3AreaSegmenter(nucleiPM, images, TMAmask, threshold,outputPath):
+def S3AreaSegmenter(nucleiPM, images, TMAmask, threshold,fileprefix,outputPath):
     nucleiCenters = nucleiPM[:,:,0]
     TMAmask= (nucleiCenters>np.amax(nucleiCenters)*0.8)*TMAmask
     area = []
@@ -112,17 +115,62 @@ def S3AreaSegmenter(nucleiPM, images, TMAmask, threshold,outputPath):
             threshold = threshold_otsu(image_gauss)
         mask=resize(image_gauss>threshold,(images.shape[1],images.shape[2]),order = 0)*TMAmask
         area.append(np.sum(np.sum(mask)))
-    np.savetxt(outputPath + os.path.sep + 'area.csv',(np.transpose(np.asarray(area))),fmt='%10.5f')  
+    os.mk    
+    np.savetxt(outputPath + os.path.sep + fileprefix + '_area.csv',(np.transpose(np.asarray(area))),fmt='%10.5f')  
     return TMAmask
-            
+
+def getMetadata(path,commit):
+    with tifffile.TiffFile(path) as tif:
+        if not tif.ome_metadata:
+            try:
+                x_res_tag = tif.pages[0].tags['XResolution'].value
+                y_res_tag = tif.pages[0].tags['YResolution'].value
+                physical_size_x = x_res_tag[0] / x_res_tag[1]
+                physical_size_y = y_res_tag[0] / y_res_tag[1]
+            except KeyError:
+                physical_size_x = 1
+                physical_size_y = 1
+            metadata_args = dict(
+            pixel_sizes=(physical_size_y, physical_size_x),
+            pixel_size_units=('µm', 'µm'),
+            software= 's3segmenter v' + commit
+            )
+        else: 
+            metadata=ome_types.from_xml(tif.ome_metadata)
+            metadata = metadata.images[0].pixels
+            metadata_args = dict(
+            pixel_sizes=(metadata.physical_size_y,metadata.physical_size_x),
+            pixel_size_units=('µm', 'µm'),
+            software= 's3segmenter v' + commit
+            )
+        return metadata_args
+
+def S3NucleiBypass(nucleiPM,nucleiImage,logSigma,TMAmask,nucleiFilter,nucleiRegion):        
+        foregroundMask =  nucleiPM
+        P = regionprops(foregroundMask, nucleiImage)
+        prop_keys = ['mean_intensity', 'label','area']
+        def props_of_keys(prop, keys):
+            return [prop[k] for k in keys]
+        
+        mean_ints, labels, areas = np.array(Parallel(n_jobs=6)(delayed(props_of_keys)(prop, prop_keys) 
+						for prop in P
+						)
+		        ).T
+        del P
+        maxArea = (logSigma[1]**2)*3/4
+        minArea = (logSigma[0]**2)*3/4
+        passed = np.logical_and(areas > minArea, areas < maxArea)
+        
+        foregroundMask *= np.isin(foregroundMask, labels[passed])
+        np.greater(foregroundMask, 0, out=foregroundMask)
+        foregroundMask = label(foregroundMask, connectivity=1).astype(np.int32)
+        return foregroundMask
 
 def S3NucleiSegmentationWatershed(nucleiPM,nucleiImage,logSigma,TMAmask,nucleiFilter,nucleiRegion):
     nucleiContours = nucleiPM[:,:,1]
     nucleiCenters = nucleiPM[:,:,0]
-    
     mask = resize(TMAmask,(nucleiImage.shape[0],nucleiImage.shape[1]),order = 0)>0
-    
-    if nucleiRegion == 'localThreshold':
+    if nucleiRegion == 'localThreshold' or nucleiRegion == 'localMax':
         Imax =  peak_local_max(extrema.h_maxima(255-nucleiContours,logSigma[0]),indices=False)
         Imax = label(Imax).astype(np.int32)
         foregroundMask =  watershed(nucleiContours, Imax, watershed_line=True)
@@ -146,27 +194,8 @@ def S3NucleiSegmentationWatershed(nucleiPM,nucleiImage,logSigma,TMAmask,nucleiFi
         foregroundMask *= np.isin(foregroundMask, labels[passed])
         np.greater(foregroundMask, 0, out=foregroundMask)
         foregroundMask = label(foregroundMask, connectivity=1).astype(np.int32)
-    elif nucleiRegion =='bypass':
-        foregroundMask =  nucleiPM[:,:,0]
-        P = regionprops(foregroundMask, nucleiImage)
-        prop_keys = ['mean_intensity', 'label','area']
-        def props_of_keys(prop, keys):
-            return [prop[k] for k in keys]
-        
-        mean_ints, labels, areas = np.array(Parallel(n_jobs=6)(delayed(props_of_keys)(prop, prop_keys) 
-						for prop in P
-						)
-		        ).T
-        del P
-        maxArea = (logSigma[1]**2)*3/4
-        minArea = (logSigma[0]**2)*3/4
-        passed = np.logical_and(areas > minArea, areas < maxArea)
-        
-        foregroundMask *= np.isin(foregroundMask, labels[passed])
-        np.greater(foregroundMask, 0, out=foregroundMask)
-        foregroundMask = label(foregroundMask, connectivity=1).astype(np.int32)
+    
     else:
-     
         if len(logSigma)==1:
              nucleiDiameter  = [logSigma*0.5, logSigma*1.5]
         else:
@@ -289,41 +318,43 @@ def S3CytoplasmSegmentation(nucleiMask,cyto,mask,cytoMethod='distanceTransform',
     cytoplasmMask = np.subtract(finalCellMask,nucleiMask)
     return cytoplasmMask,nucleiMask,finalCellMask
     
-def exportMasks(mask,image,outputPath,filePrefix,fileName,saveFig=True,saveMasks = True):
+def exportMasks(mask,image,outputPath,filePrefix,fileName,commit,metadata_args,saveFig=True,saveMasks = True):
     outputPath =outputPath + os.path.sep + filePrefix
     if not os.path.exists(outputPath):
         os.makedirs(outputPath)
+    previewPath = outputPath + os.path.sep + 'qc'        
+    if not os.path.exists(previewPath):
+        os.makedirs(previewPath)
+   
     if saveMasks ==True:
-        kwargs={}
-        kwargs['bigtiff'] = True
-        kwargs['photometric'] = 'minisblack'
-        resolution = np.round(1)
-        kwargs['resolution'] = (resolution, resolution, 'cm')
-        kwargs['metadata'] = None
-        kwargs['description'] = '!!xml!!'
-        imsave(outputPath + os.path.sep + fileName + 'Mask.tif',mask, plugin="tifffile")
-        
+        save_pyramid(
+            mask,
+            outputPath + os.path.sep + fileName + '.ome.tif',
+            channel_names=fileName,
+            **metadata_args
+        )     
     if saveFig== True:
         mask=np.uint8(mask>0)
         edges = find_boundaries(mask,mode = 'outer')
         stacked_img=np.stack((np.uint16(edges)*np.amax(image),image),axis=0)
-        tifffile.imsave(outputPath + os.path.sep + fileName + 'Outlines.tif',stacked_img)
+        save_pyramid(
+            stacked_img,
+            previewPath + os.path.sep + fileName + 'Outlines.ome.tif',
+            channel_names=[f'{fileName} outlines', 'Segmentation image'],
+            **metadata_args
+        )
         
 def S3punctaDetection(spotChan,mask,sigma,SD):
     Ilog = -gaussian_laplace(np.float32(spotChan),sigma)
-    fgm=peak_local_max(Ilog, indices=False,footprint=np.ones((3, 3)))
+    tissueMask = spotChan >0
+    fgm=peak_local_max(Ilog, indices=False,footprint=np.ones((3, 3)))*tissueMask
     test=Ilog[fgm==1]
     med = np.median(test)
     mad = np.median(np.absolute(test - med))
     thresh = med + 1.4826*SD*mad
     return (Ilog>thresh)*fgm*(mask>0)
-    
-#    stacked_img=np.stack((spots*4095,nucleiCrop),axis=0)
-#    tifffile.imsave('D:/Seidman/ZeissTest Sets/registration/spottest.tif',stacked_img)
-       
-        
-    # assign nan to tissue mask
-
+ 
+     
 
 if __name__ == '__main__':
     parser=argparse.ArgumentParser()
@@ -339,128 +370,44 @@ if __name__ == '__main__':
     parser.add_argument("--crop",choices=['interactiveCrop','autoCrop','noCrop','dearray','plate'], default = 'noCrop')
     parser.add_argument("--cytoMethod",choices=['hybrid','distanceTransform','bwdistanceTransform','ring'],default = 'distanceTransform')
     parser.add_argument("--nucleiFilter",choices=['IntPM','LoG','Int','none'],default = 'IntPM')
-    parser.add_argument("--nucleiRegion",choices=['watershedContourDist','watershedContourInt','watershedBWDist','dilation','localThreshold','bypass','pixellevel'], default = 'watershedContourInt')
+    parser.add_argument("--nucleiRegion",choices=['watershedContourDist','watershedContourInt','watershedBWDist','dilation','localThreshold','localMax','bypass','pixellevel'], default = 'watershedContourInt')
     parser.add_argument("--pixelThreshold",type = float, default = -1)
     parser.add_argument("--segmentCytoplasm",choices = ['segmentCytoplasm','ignoreCytoplasm'],default = 'ignoreCytoplasm')
     parser.add_argument("--cytoDilation",type = int, default = 5)
     parser.add_argument("--logSigma",type = int, nargs = '+', default = [3, 60])
-    parser.add_argument("--CytoMaskChan",type=int, nargs = '+', default=[1])
-    parser.add_argument("--pixelMaskChan",type=int, nargs = '+', default=[1])
-    parser.add_argument("--TissueMaskChan",type=int, nargs = '+', default=-1)
-    parser.add_argument("--detectPuncta",type=int, nargs = '+', default=[-1])
-    parser.add_argument("--punctaSigma", nargs = '+', type=float, default=[1])
+    parser.add_argument("--CytoMaskChan",type=int, nargs = '+', default=[2])
+    parser.add_argument("--pixelMaskChan",type=int, nargs = '+', default=[2])
+    parser.add_argument("--TissueMaskChan",type=int, nargs = '+', default=0)
+    parser.add_argument("--detectPuncta",type=int, nargs = '+', default=[0])
+    parser.add_argument("--punctaSigma", nargs = '+', type=float, default=[0])
     parser.add_argument("--punctaSD", nargs = '+', type=float, default=[4])
     parser.add_argument("--saveMask",action='store_false')
     parser.add_argument("--saveFig",action='store_false')
     args = parser.parse_args()
     
-    # gather filename information
-    #exemplar001
-#    imagePath = 'D:/LSP/cycif/testsets/exemplar-001/registration/exemplar-001small.ome.tif'
-#    outputPath = 'D:/LSP/cycif/testsets/exemplar-001/segmentation'
-##    nucleiClassProbPath = 'D:/LSP/cycif/testsets/exemplar-001/probability_maps/exemplar-001_NucleiPM_0.tif'
-##    contoursClassProbPath = 'D:/LSP/cycif/testsets/exemplar-001/probability_maps/exemplar-001_ContoursPM_0.tif'
-#    contoursClassProbPath =''
-#    stackProbPath = 'D:/LSP/cycif/testsets/exemplar-001_Probabilities_0.tif'
-#    maskPath = 'D:/LSP/cycif/testsets/exemplar-001/dearray/masks/A1_mask.tif'
-#    args.cytoMethod = 'hybrid'
-#    args.nucleiRegion = 'localThreshold'
-#    args.segmentCytoplasm = 'segmentCytoplasm'
-	
-#	    exemplar002
-#    imagePath = 'D:/LSP/cycif/testsets/exemplar-002/dearray/1.tif'
-#    outputPath = 'D:/LSP/cycif/testsets/exemplar-002/segmentation'
-#    nucleiClassProbPath = ''#'D:/LSP/cycif/testsets/exemplar-002/prob_map/1_NucleiPM_1.tif'
-#    contoursClassProbPath = ''#'D:/LSP/cycif/testsets/exemplar-002/prob_map/1_ContoursPM_1.tif'
-#    stackProbPath = 'D:/LSP/cycif/testsets/exemplar-002/probability-maps/unmicst_1new_Probabilities_1.tif'
-#    maskPath = 'D:/LSP/cycif/testsets/exemplar-002/dearrayPython/masks/1_mask.tif'
-#    args.probMapChan =1
-#    args.cytoMethod = 'hybrid'
-#    args.mask = 'TMA'
-#    args.crop = 'dearray'
-#    args.crop = 'autoCrop'
-#    args.segmentCytoplasm = 'segmentCytoplasm'
-	#PTCL
-#    imagePath = 'D:/LSP/cycif/testsets/PTCL/dearrayPython/1.tif'
-#    outputPath = 'D:/LSP/cycif/testsets/PTCL/dearrayPython/segmentation'
-#    nucleiClassProbPath = ''#'D:/LSP/cycif/testsets/exemplar-002/prob_map/1_NucleiPM_1.tif'
-#    contoursClassProbPath = ''#'D:/LSP/cycif/testsets/exemplar-002/prob_map/1_ContoursPM_1.tif'
-#    stackProbPath = 'D:/LSP/cycif/testsets/PTCL/prob_maps/1_Probabilities_40.tif'
-#    maskPath = 'D:/LSP/cycif/testsets/exemplar-002/dearrayPython/masks/1_mask.tif'   
-#    args.crop = 'dearray'
-#    args.segmentCytoplasm = 'segmentCytoplasm'
-#	
-	    #punctatest
-#    imagePath = 'Z:/IDAC/Clarence/Seidman/ZeissMouseTestSet/31082020_XXWT_Txnip550_Ddx3x647_WGA488_40x_1.tif'
-#    outputPath = 'Z:/IDAC/Clarence/Seidman/ZeissMouseTestSet/segmentation'
-##    nucleiClassProbPath = 'Z:/IDAC/Clarence/Seidman/ZeissMouseTestSet/probability-maps/test_NucleiPM_1.tif'
-##    contoursClassProbPath = 'Z:/IDAC/Clarence/Seidman/DanMouse/probability-maps/test_ContoursPM_1.tif'
-#    contoursClassProbPath =''
-#    stackProbPath = 'Z:/IDAC/Clarence/Seidman/ZeissMouseTestSet/probability-maps/31082020_XXWT_Txnip550_Ddx3x647_WGA488_40x_1_Probabilities_2.tif'
-#    maskPath = 'D:/Seidman/ZeissTest Sets/segmentation/13042020_15AP_FAP488_LINC550_DCN647_WGA_40x_1/cellMask.tif'
-#    args.nucleiRegion = 'localThreshold'
-#    args.logSigma = [45, 300]
-#    args.segmentCytoplasm = 'ignoreCytoplasm'
-#    args.detectPuncta = [1]
-#    args.punctaSigma = [1]
-#    args.punctaSD = [3]
-    
-    
-	#plate 
-#    imagePath = 'Y:/sorger/data/computation/Jeremy/caitlin-ddd-cycif-registered/Plate1/E3_fld_1/registration/E3_fld_1.ome.tif'
-#    outputPath = 'Y:/sorger/data/computation/Jeremy/caitlin-ddd-cycif-registered/Plate1/E3_fld_1/segmentation'
-#    nucleiClassProbPath = 'Y:/sorger/data/computation/Jeremy/caitlin-ddd-cycif-registered/Plate1/E3_fld_1/prob_maps/E3_fld_1_NucleiPM_1.tif'
-#    contoursClassProbPath = 'Y:/sorger/data/computation/Jeremy/caitlin-ddd-cycif-registered/Plate1/E3_fld_1/prob_maps/E3_fld_1_ContoursPM_1.tif'
-#    maskPath = 'D:/LSP/cycif/testsets/exemplar-001/dearray/masks/A1_mask.tif'
-#    args.crop = 'plate'
-#    args.cytoMethod ='hybrid'
-        
-    #large tissue
-#    imagePath =  'D:/WD-76845-097.ome.tif'
-#    outputPath = 'D:/'
-##    nucleiClassProbPath = 'D:/WD-76845-097_NucleiPM_28.tif'
-#    contoursClassProbPath = ""#'D:/WD-76845-097_ContoursPM_28.tif'
-#    stackProbPath = 'D:/ilastik/WD-76845-097_Probabilities_0.tif'
-#    maskPath = 'D:/LSP/cycif/testsets/exemplar-001/dearray/masks/A1_mask.tif'
-#    args.nucleiRegion = 'localThreshold'
-#    args.crop = 'autoCrop' 
-#    args.TissueMaskChan =[0]
-	
-	    #maskRCNN
-#    imagePath =  'D:/Seidman/s3segtest/registration/1.tif'
-#    outputPath = 'D:/Seidman/s3segtest/segmentation'
-#    stackProbPath = 'D:/Seidman/s3segtest/1_Probabilities_0.tif'
-#    contoursClassProbPath = ''
-#    maskPath = 'D:/LSP/cycif/testsets/exemplar-001/dearray/masks/A1_mask.tif'
-#    args.nucleiRegion = 'bypass'
-#    args.crop = 'noCrop' 
-#    args.TissueMaskChan =[0]
-#    args.logSigma = [45,300]
-        
-#    #pixellevel
-#    imagePath =  'D:/Olesja/D2107_spleen_DAPI-EdU_01/Layer0/D2107_spleen_DAPI-EdU_01.btf'
-#    outputPath = 'D:/Olesja/D2107_spleen_DAPI-EdU_01/segmentation'
-#    stackProbPath = 'D:/Seidman/s3segtest/1_Probabilities_0.tif'
-#    contoursClassProbPath = 'D:/Olesja/D2107_spleen_DAPI-EdU_01/prob_maps3Class/D2107_spleen_DAPI-EdU_01_ContoursPM_0.tif'
-#    nucleiClassProbPath = 'D:/Olesja/D2107_spleen_DAPI-EdU_01/prob_maps3Class/D2107_spleen_DAPI-EdU_01_NucleiPM_0.tif'
-#    maskPath = 'D:/LSP/cycif/testsets/exemplar-001/dearray/masks/A1_mask.tif'
-#    args.nucleiRegion = 'pixellevel'
-#    args.crop = 'noCrop' 
-#    args.TissueMaskChan =[0]
-#    args.pixelThreshold = 0.06
-           
     imagePath = args.imagePath
     outputPath = args.outputPath
     nucleiClassProbPath = args.nucleiClassProbPath
     contoursClassProbPath = args.contoursClassProbPath
     stackProbPath = args.stackProbPath
     maskPath = args.maskPath
-       
+    
+    commit = '1.3.7'#subprocess.check_output(['git', 'describe', '--tags']).decode('ascii').strip()
+    metadata = getMetadata(imagePath,commit)
+    
     fileName = os.path.basename(imagePath)
     filePrefix = fileName[0:fileName.index('.')]
-    
+ 
+    # convert 1-based indexing to 0-based indexing
+    CytoMaskChan = args.CytoMaskChan
+    CytoMaskChan[:] = [number - 1 for number in CytoMaskChan]
+    pixelMaskChan = args.pixelMaskChan
+    pixelMaskChan[:] = [number - 1 for number in pixelMaskChan]
+ 
+     
     if not os.path.exists(outputPath):
         os.makedirs(outputPath)
+        
     
     # get channel used for nuclei segmentation
 
@@ -471,29 +418,25 @@ if __name__ == '__main__':
     elif len(stackProbPath)>0:
         legacyMode = 0
         probPrefix = os.path.basename(stackProbPath)
-        index = re.search('%s(.*)%s' % ('Probabilities', '.tif'), stackProbPath).group(1)
-        if len(index)==0:
-            nucMaskChan = args.probMapChan
-        else:
-            nucMaskChan  = int(re.sub("\D", "", index))
     else:
         print('NO PROBABILITY MAP PROVIDED')
-    if args.probMapChan ==-1:
-        if nucMaskChan ==-1:
-            sys.exit('INVALID NUCLEI CHANNEL SELECTION. SELECT CHANNEL USING --probMapChan')
-        else:
-            print('extracting nuclei channel from filename')
+
+    if args.probMapChan==-1:
+        print('Using first channel by default!')
+        nucMaskChan = 0
     else:
         nucMaskChan = args.probMapChan
+        nucMaskChan = nucMaskChan -1 #convert 1-based indexing to 0-based indexing      
 
-    if args.TissueMaskChan==-1:
-        TissueMaskChan = copy.copy(args.CytoMaskChan)
+    if args.TissueMaskChan==0:
+        TissueMaskChan = copy.copy(CytoMaskChan)
         TissueMaskChan.append(nucMaskChan)
     else:
         TissueMaskChan = args.TissueMaskChan[:]
+        TissueMaskChan[:] = [number - 1 for number in TissueMaskChan]#convert 1-based indexing to 0-based indexing        
         TissueMaskChan.append(nucMaskChan)
-         
-    #crop images if needed
+
+	#crop images if needed
     if args.crop == 'interactiveCrop':
         nucleiCrop = tifffile.imread(imagePath,key = nucMaskChan)
         r=cv2.selectROI(resize(nucleiCrop,(nucleiCrop.shape[0] // 30, nucleiCrop.shape[1] // 30)))
@@ -519,9 +462,12 @@ if __name__ == '__main__':
         nucleiPM = np.dstack((nucleiPM,nucleiProbMaps[int(PMrect[0]):int(PMrect[0]+PMrect[2]), int(PMrect[1]):int(PMrect[1]+PMrect[3])]))
     else:
         nucleiProbMaps = imread(stackProbPath)
-        nucleiPM = nucleiProbMaps[int(PMrect[0]):int(PMrect[0]+PMrect[2]), int(PMrect[1]):int(PMrect[1]+PMrect[3]),0:2]
+        if len(nucleiProbMaps.shape)==2:
+            nucleiPM = nucleiProbMaps[int(PMrect[0]):int(PMrect[0]+PMrect[2]), int(PMrect[1]):int(PMrect[1]+PMrect[3])]
+        else:
+            nucleiPM = nucleiProbMaps[int(PMrect[0]):int(PMrect[0]+PMrect[2]), int(PMrect[1]):int(PMrect[1]+PMrect[3]),:]
         PMSize = nucleiProbMaps.shape
-
+      
     # mask the core/tissue
     if args.crop == 'dearray':
         TMAmask = tifffile.imread(maskPath)
@@ -546,84 +492,104 @@ if __name__ == '__main__':
                 count+=1
         TMAmask = np.max(tissue,axis = 0)
 
- #       tissue_gauss = tissueCrop
-#        tissue_gauss1 = tissue_gauss.astype(float)
-#        tissue_gauss1[tissue_gauss>np.percentile(tissue_gauss,99)]=np.nan
-#        TMAmask = np.log2(tissue_gauss+1)>threshold_otsu(np.log2(tissue_gauss+1))
-        #imshow(TMAmask)
-        del tissue_gauss, tissue
 
+        del tissue_gauss, tissue
+      
     # nuclei segmentation
     if args.nucleiRegion == 'pixellevel':
-        pixelTissue = np.empty((len(args.pixelMaskChan),nucleiCrop.shape[0],nucleiCrop.shape[1]),dtype=np.uint16)
+        pixelTissue = np.empty((len(pixelMaskChan),nucleiCrop.shape[0],nucleiCrop.shape[1]),dtype=np.uint16)
         count=0
-        for iChan in args.pixelMaskChan:
+        for iChan in pixelMaskChan:
                 pixelCrop = tifffile.imread(imagePath,key=iChan)
                 pixelTissue[count,:,:] = pixelCrop[int(PMrect[0]):int(PMrect[0]+PMrect[2]), int(PMrect[1]):int(PMrect[1]+PMrect[3])]
                 count+=1
-        nucleiMask = S3AreaSegmenter(nucleiPM, pixelTissue, TMAmask,args.pixelThreshold,outputPath)
+        nucleiMask = S3AreaSegmenter(nucleiPM, pixelTissue, TMAmask,args.pixelThreshold,filePrefix,outputPath)
+    elif args.nucleiRegion == 'bypass':    
+        nucleiMask = S3NucleiBypass(nucleiPM,nucleiCrop,args.logSigma,TMAmask,args.nucleiFilter,args.nucleiRegion)
     else:
-		   nucleiMask = S3NucleiSegmentationWatershed(nucleiPM,nucleiCrop,args.logSigma,TMAmask,args.nucleiFilter,args.nucleiRegion)
+        nucleiMask = S3NucleiSegmentationWatershed(nucleiPM,nucleiCrop,args.logSigma,TMAmask,args.nucleiFilter,args.nucleiRegion)
     del nucleiPM
     # cytoplasm segmentation
     if args.segmentCytoplasm == 'segmentCytoplasm':
         count =0
         if args.crop == 'noCrop' or args.crop == 'dearray' or args.crop == 'plate':
-            cyto=np.empty((len(args.CytoMaskChan),nucleiCrop.shape[0],nucleiCrop.shape[1]),dtype=np.uint16)    
-            for iChan in args.CytoMaskChan:
+            cyto=np.empty((len(CytoMaskChan),nucleiCrop.shape[0],nucleiCrop.shape[1]),dtype=np.uint16)    
+            for iChan in CytoMaskChan:
                 cyto[count,:,:] =  tifffile.imread(imagePath, key=iChan)
                 count+=1
         elif args.crop =='autoCrop':
-            cyto=np.empty((len(args.CytoMaskChan),int(rect[2]),int(rect[3])),dtype=np.int16)
-            for iChan in args.CytoMaskChan:
+            cyto=np.empty((len(CytoMaskChan),int(rect[2]),int(rect[3])),dtype=np.int16)
+            for iChan in CytoMaskChan:
                 cytoFull= tifffile.imread(imagePath, key=iChan)
                 cyto[count,:,:] = cytoFull[int(PMrect[0]):int(PMrect[0]+PMrect[2]), int(PMrect[1]):int(PMrect[1]+PMrect[3])]
                 count+=1                
         else:
-            cyto=np.empty((len(args.CytoMaskChan),rect[3],rect[2]),dtype=np.int16)
-            for iChan in args.CytoMaskChan:
+            cyto=np.empty((len(CytoMaskChan),rect[3],rect[2]),dtype=np.int16)
+            for iChan in CytoMaskChan:
                 cytoFull= tifffile.imread(imagePath, key=iChan)
                 cyto[count,:,:] = cytoFull[int(PMrect[0]):int(PMrect[0]+PMrect[2]), int(PMrect[1]):int(PMrect[1]+PMrect[3])]
                 count+=1
         cyto = np.amax(cyto,axis=0)
         cytoplasmMask,nucleiMaskTemp,cellMask = S3CytoplasmSegmentation(nucleiMask,cyto,TMAmask,args.cytoMethod,args.cytoDilation)
-        exportMasks(nucleiMaskTemp,nucleiCrop,outputPath,filePrefix,'nuclei',args.saveFig,args.saveMask)
-        exportMasks(cytoplasmMask,cyto,outputPath,filePrefix,'cyto',args.saveFig,args.saveMask)
-        exportMasks(cellMask,cyto,outputPath,filePrefix,'cell',args.saveFig,args.saveMask)
+        exportMasks(nucleiMaskTemp,nucleiCrop,outputPath,filePrefix,'nuclei',commit,metadata,args.saveFig,args.saveMask)
+        exportMasks(cytoplasmMask,cyto,outputPath,filePrefix,'cyto',commit,metadata,args.saveFig,args.saveMask)
+        exportMasks(cellMask,cyto,outputPath,filePrefix,'cell',commit,metadata,args.saveFig,args.saveMask)
   
         cytoplasmMask,nucleiMaskTemp,cellMask = S3CytoplasmSegmentation(nucleiMask,cyto,TMAmask,'ring',args.cytoDilation)
-        exportMasks(nucleiMaskTemp,nucleiCrop,outputPath,filePrefix,'nucleiRing',args.saveFig,args.saveMask)
-        exportMasks(cytoplasmMask,cyto,outputPath,filePrefix,'cytoRing',args.saveFig,args.saveMask)
-        exportMasks(cellMask,cyto,outputPath,filePrefix,'cellRing',args.saveFig,args.saveMask)
+        exportMasks(nucleiMaskTemp,nucleiCrop,outputPath,filePrefix,'nucleiRing',commit,metadata,args.saveFig,args.saveMask)
+        exportMasks(cytoplasmMask,cyto,outputPath,filePrefix,'cytoRing',commit,metadata,args.saveFig,args.saveMask)
+        exportMasks(cellMask,cyto,outputPath,filePrefix,'cellRing',commit,metadata,args.saveFig,args.saveMask)
         
     elif args.segmentCytoplasm == 'ignoreCytoplasm':
-        exportMasks(nucleiMask,nucleiCrop,outputPath,filePrefix,'nuclei')
+        exportMasks(nucleiMask,nucleiCrop,outputPath,filePrefix,'nuclei',commit,metadata)
         cellMask = nucleiMask
-        exportMasks(nucleiMask,nucleiCrop,outputPath,filePrefix,'cell')
+        exportMasks(nucleiMask,nucleiCrop,outputPath,filePrefix,'cell',commit,metadata)
         cytoplasmMask = nucleiMask
         
-        
-    if (np.min(args.detectPuncta)>-1):
-        if len(args.detectPuncta) != len(args.punctaSigma):
-            args.punctaSigma = args.punctaSigma[0] * np.ones(len(args.detectPuncta))
+    detectPuncta = args.detectPuncta
+    if (np.min(detectPuncta)>0):
+        detectPuncta[:] = [number - 1 for number in detectPuncta] #convert 1-based indexing to 0-based indexing    
+        if len(detectPuncta) != len(args.punctaSigma):
+            args.punctaSigma = args.punctaSigma[0] * np.ones(len(detectPuncta))
  
   
-        if len(args.detectPuncta) != len(args.punctaSD):
-            args.punctaSD = args.punctaSD[0] * np.ones(len(args.detectPuncta))
+        if len(detectPuncta) != len(args.punctaSD):
+            args.punctaSD = args.punctaSD[0] * np.ones(len(detectPuncta))
   
         counter=0
-        for iPunctaChan in args.detectPuncta:
+        for iPunctaChan in detectPuncta:
             punctaChan = tifffile.imread(imagePath,key = iPunctaChan)
             punctaChan = punctaChan[int(PMrect[0]):int(PMrect[0]+PMrect[2]), int(PMrect[1]):int(PMrect[1]+PMrect[3])]
             spots=S3punctaDetection(punctaChan,cellMask,args.punctaSigma[counter],args.punctaSD[counter])
-            cellspotmask = nucleiMask#tifffile.imread(maskPath) #REMOVE THIS LATER
+            cellspotmask = nucleiMask
             P = regionprops(cellspotmask,intensity_image = spots ,cache=False)
             numSpots = []
             for prop in P:
                 numSpots.append(np.uint16(np.round(prop.mean_intensity * prop.area)))
-            np.savetxt(outputPath + os.path.sep + 'numSpots_chan' + str(iPunctaChan) +'.csv',(np.transpose(np.asarray(numSpots))),fmt='%10.5f')    
+            np.savetxt(outputPath + os.path.sep + 'numSpots_chan' + str(iPunctaChan+1) +'.csv',(np.transpose(np.asarray(numSpots))),fmt='%10.5f')    
             edges = 1-(cellMask>0)
             stacked_img=np.stack((np.uint16((spots+edges)>0)*np.amax(punctaChan),punctaChan),axis=0)
+<<<<<<< HEAD
             tifffile.imsave(outputPath + os.path.sep + filePrefix + os.path.sep + 'punctaChan'+str(iPunctaChan) + 'Outlines.tif',stacked_img)
             counter=counter+1        
         #fix bwdistance watershed
+=======
+            
+            
+            
+            outputPathPuncta = outputPath + os.path.sep + filePrefix + os.path.sep + 'punctaChan'+str(iPunctaChan+1) + 'Outlines.ome.tif'
+            
+            metadata_args = dict(
+                pixel_sizes=(metadata.physical_size_y, metadata.physical_size_x),
+                pixel_size_units=('µm', 'µm'),
+                software= 's3segmenter v' + commit
+                )
+            save_pyramid(
+                stacked_img,
+                outputPathPuncta,
+                channel_names=['puncta outlines', 'image channel'],
+                **metadata_args
+                )     
+            
+            counter=counter+1    
+
