@@ -569,13 +569,7 @@ if __name__ == '__main__':
             np.savetxt(outputPath + os.path.sep + 'numSpots_chan' + str(iPunctaChan+1) +'.csv',(np.transpose(np.asarray(numSpots))),fmt='%10.5f')    
             edges = 1-(cellMask>0)
             stacked_img=np.stack((np.uint16((spots+edges)>0)*np.amax(punctaChan),punctaChan),axis=0)
-<<<<<<< HEAD
-            tifffile.imsave(outputPath + os.path.sep + filePrefix + os.path.sep + 'punctaChan'+str(iPunctaChan) + 'Outlines.tif',stacked_img)
-            counter=counter+1        
-        #fix bwdistance watershed
-=======
-            
-            
+             
             
             outputPathPuncta = outputPath + os.path.sep + filePrefix + os.path.sep + 'punctaChan'+str(iPunctaChan+1) + 'Outlines.ome.tif'
             
