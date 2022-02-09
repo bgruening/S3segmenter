@@ -331,6 +331,7 @@ def exportMasks(mask,image,outputPath,filePrefix,fileName,commit,metadata_args,s
             mask,
             outputPath + os.path.sep + fileName + '.ome.tif',
             channel_names=fileName,
+            is_mask=True,
             **metadata_args
         )     
     if saveFig== True:
@@ -341,6 +342,7 @@ def exportMasks(mask,image,outputPath,filePrefix,fileName,commit,metadata_args,s
             stacked_img,
             previewPath + os.path.sep + fileName + 'Outlines.ome.tif',
             channel_names=[f'{fileName} outlines', 'Segmentation image'],
+            is_mask=False,
             **metadata_args
         )
         
@@ -392,7 +394,7 @@ if __name__ == '__main__':
     stackProbPath = args.stackProbPath
     maskPath = args.maskPath
     
-    commit = '1.3.7'#subprocess.check_output(['git', 'describe', '--tags']).decode('ascii').strip()
+    commit = '1.3.11'#subprocess.check_output(['git', 'describe', '--tags']).decode('ascii').strip()
     metadata = getMetadata(imagePath,commit)
     
     fileName = os.path.basename(imagePath)
@@ -573,16 +575,17 @@ if __name__ == '__main__':
             
             outputPathPuncta = outputPath + os.path.sep + filePrefix + os.path.sep + 'punctaChan'+str(iPunctaChan+1) + 'Outlines.ome.tif'
             
-            metadata_args = dict(
-                pixel_sizes=(metadata.physical_size_y, metadata.physical_size_x),
-                pixel_size_units=('µm', 'µm'),
-                software= 's3segmenter v' + commit
-                )
+            # metadata_args = dict(
+            #     pixel_sizes=(metadata.physical_size_y, metadata.physical_size_x),
+            #     pixel_size_units=('µm', 'µm'),
+            #     software= 's3segmenter v' + commit
+            #     )
             save_pyramid(
                 stacked_img,
                 outputPathPuncta,
                 channel_names=['puncta outlines', 'image channel'],
-                **metadata_args
+                is_mask=False,
+                **metadata
                 )     
             
             counter=counter+1    
