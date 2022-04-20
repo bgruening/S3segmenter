@@ -1,26 +1,23 @@
-<tool id="s3segmenter" name="s3segmenter" version="@VERSION@.0" profile="17.09">
+<tool id="s3segmenter" name="s3segmenter" version="@VERSION@.0" profile="21.05">
     <description>S3segmenter is a Python-based set of functions that generates single cell (nuclei and cytoplasm) label masks.</description>
     <macros>
         <import>macros.xml</import>
     </macros>
- 
     <expand macro="requirements"/>
-    @VERSION_CMD@
-
+    <expand macro="version_cmd"/>
     <command detect_errors="exit_code"><![CDATA[
 
-        ln -s '${imagePath}' ./image.tif;
-
+        ln -s '${imagePath}' ./image.tif &&
         #if $contoursClassProbPath
-        ln -s ${contoursClassProbPath} ./ContoursPM.tif;
+            ln -s '${contoursClassProbPath}' ./ContoursPM.tif &&
         #end if
 
         #if $nucleiClassProbPath
-        ln -s ${nucleiClassProbPath} ./NucleiPM.tif;
+            ln -s '${nucleiClassProbPath}' ./NucleiPM.tif &&
         #end if
 
         #if $stackProbPath
-        ln -s ${stackProbPath} ./Probabilities.tif;
+            ln -s '${stackProbPath}' ./Probabilities.tif &&
         #end if
 
 
@@ -28,22 +25,22 @@
         --imagePath ./image.tif
 
         #if $contoursClassProbPath
-        --contoursClassProbPath ./ContoursPM.tif
+            --contoursClassProbPath ./ContoursPM.tif
         #end if
 
         #if $nucleiClassProbPath
-        --nucleiClassProbPath ./NucleiPM.tif
+            --nucleiClassProbPath ./NucleiPM.tif
         #end if
 
         #if $stackProbPath
-        --stackProbPath ./Probabilities.tif
+            --stackProbPath ./Probabilities.tif
         #end if
 
         --probMapChan $probMapChan
         --crop $crop_select.crop
         
         #if $crop_select.crop == "dearray"
-          --maskPath $crop_select.maskPath
+            --maskPath $crop_select.maskPath
         #end if
 
         --cytoMethod $cytoMethod
@@ -51,8 +48,8 @@
         --nucleiRegion $nucleiRegion_select.nucleiRegion
 
         #if $nucleiRegion_select.nucleiRegion == "pixellevel"
-          --pixelThreshold $nucleiRegion_select.pixelThreshold
-          --pixelMaskChan $nucleiRegion_select.pixelMaskChan
+            --pixelThreshold $nucleiRegion_select.pixelThreshold
+            --pixelMaskChan $nucleiRegion_select.pixelMaskChan
         #end if
 
         --segmentCytoplasm $segmentCytoplasm
@@ -65,19 +62,18 @@
         --punctaSD $adv.punctaSD
 
         #if not $saveMask
-        --saveMask
+            --saveMask
         #end if
 
         #if not $saveFig
-        --saveFig
+            --saveFig
         #end if
 
-        --outputPath .
+        --outputPath ./
     ]]></command>
 
 
     <inputs>
-
         <param name="imagePath" type="data" format="tiff" label="Image File"/>
         <param name="contoursClassProbPath" type="data" format="tiff" optional="true" label="Contours Class Probabilities"/>
         <param name="nucleiClassProbPath" type="data" format="tiff" optional="true" label="Nuclei Class Probabilities"/>
@@ -91,6 +87,9 @@
                 <option value="dearray">De-array</option>
                 <option value="plate">Plate</option>
             </param>
+            <when value="noCrop"/>
+            <when value="autoCrop"/>
+            <when value="plate"/>
             <when value="dearray">
                 <param name="maskPath" type="data" format="tiff" label="TMA Mask File"/>
             </when>
@@ -120,6 +119,13 @@
                 <option value="bypass">bypass</option>
                 <option value="pixellevel">pixellevel</option>
             </param>
+            <when value="watershedContourDist"/>
+            <when value="watershedContourInt"/>
+            <when value="watershedBWDist"/>
+            <when value="dilation"/>
+            <when value="localThreshold"/>
+            <when value="localMax"/>
+            <when value="pixellevel"/>
             <when value="pixellevel">
                 <param name="pixelThreshold" type="float" value="-1.0" Label="Pixel Threshold"/>
                 <param name="pixelMaskChan" type="text" value="2" Label="Pixel Mask Channel"/>
@@ -144,8 +150,6 @@
             <param name="punctaSigma" type="text" value="1" label="Puncta Sigma"/>
             <param name="punctaSD" type="text" value="4" label="Puncta SD"/>
         </section>
-        
-
     </inputs>
     <outputs>
         <data format="tiff" name="cell_mask" from_work_dir="image/cell.ome.tif" label="cellMasks">
@@ -154,10 +158,10 @@
         <data format="tiff" name="nuclei_mask" from_work_dir="image/nuclei.ome.tif" label="nucleiMasks">
             <filter>saveMask is True</filter>
         </data>
-	<data format="tiff" name="cell_outlines" from_work_dir="image/qc/cellOutlines.ome.tif" label="cellOutlines">
+        <data format="tiff" name="cell_outlines" from_work_dir="image/qc/cellOutlines.ome.tif" label="cellOutlines">
             <filter>saveFig is True</filter>
         </data>
-	<data format="tiff" name="nuclei_outlines" from_work_dir="image/qc/nucleiOutlines.ome.tif" label="nucleiOutlines">
+        <data format="tiff" name="nuclei_outlines" from_work_dir="image/qc/nucleiOutlines.ome.tif" label="nucleiOutlines">
             <filter>saveFig is True</filter>
         </data>
     </outputs>
